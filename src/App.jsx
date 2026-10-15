@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import "./App.css";
 
 // The API runs on the Express backend, not the Vite frontend.
-const API = import.meta.env.VITE_API_URL || "/api";
+const API = import.meta.env.VITE_API_URL;
 
 async function request(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
