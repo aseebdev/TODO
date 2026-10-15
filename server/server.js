@@ -10,16 +10,27 @@ const cors = require("cors");
 const app = express();
 const PORT = Number(process.env.PORT) || 5001;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5174";
+const ALLOWED_ORIGINS = new Set([
+  CLIENT_URL,
+  "https://todo-dmgo.vercel.app",
+  "https://todo-um7e.vercel.app",
+]);
+
+// Needed when hosted behind a proxy such as Vercel/Render.
+if (process.env.NODE_ENV === "production") {
+  app.set("trust proxy", 1);
+}
 
 app.use(cors({
-  // Vite may use 5173, 5174, or 5175 if the previous port is busy.
   origin(origin, callback) {
-    if (!origin || origin === CLIENT_URL ||
-        /^http:\/\/localhost:\d+$/.test(origin) ||
-        /^http:\/\/127\.0\.0\.1:\d+$/.test(origin)) {
+    // Allow server-to-server / health checks without an Origin header,
+    // localhost development, the configured frontend, and Vercel deployments.
+    const isLocalhost = origin && /^http:\\/\\/(localhost|127\\.0\\.0\\.1):\\d+$/.test(origin);
+    const isVercelDeployment = origin && /^https:\\/\\/[a-z0-9-]+\\.vercel\\.app$/.test(origin);
+    if (!origin || ALLOWED_ORIGINS.has(origin) || isLocalhost || isVercelDeployment) {
       return callback(null, true);
     }
-    return callback(new Error("Origin is not allowed by CORS"));
+    return callback(new Error(`Origin not allowed by CORS: ${origin}`));
   },
   credentials: true,
 }));
@@ -33,7 +44,9 @@ app.use(session({
   store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
   cookie: {
     httpOnly: true,
-    sameSite: "lax",
+    // Frontend and API use different Vercel subdomains, so production
+    // session cookies must support cross-site HTTPS requests.
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
     secure: process.env.NODE_ENV === "production",
     maxAge: 7 * 24 * 60 * 60 * 1000,
   },
@@ -153,7 +166,7 @@ app.post("/api/logout", auth, (req, res, next) => {
     if (err) return next(err);
     res.clearCookie("todo.sid", {
       httpOnly: true,
-      sameSite: "lax",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
       secure: process.env.NODE_ENV === "production",
     });
     res.json({ message: "Logged out" });
@@ -219,7 +232,7 @@ app.delete("/api/tasks/:id", auth, async (req, res, next) => {
 app.use((err, req, res, next) => {
   console.error(err);
   if (res.headersSent) return next(err);
-  res.status(500).json({ message: "Server error. Check the backend terminal." });
+  res.status(500).json({ message: "Server error. Check the backend logs." });
 });
 
 if (!process.env.MONGO_URI) {
