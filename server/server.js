@@ -22,17 +22,8 @@ if (process.env.NODE_ENV === "production") {
 }
 
 app.use(cors({
-  origin(origin, callback) {
-    // Allow server-to-server / health checks without an Origin header,
-    // localhost development, the configured frontend, and Vercel deployments.
-    const isLocalhost = origin && /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin);
-    const isVercelDeployment = origin && /^https:\/\/[a-z0-9-]+\.vercel\.app$/.test(origin);
-    if (!origin || ALLOWED_ORIGINS.has(origin) || isLocalhost || isVercelDeployment) {
-      return callback(null, true);
-    }
-    return callback(new Error(`Origin not allowed by CORS: ${origin}`));
-  },
-  credentials: true,
+  origin: "https://todo-dmgo.vercel.app",
+  credentials: true
 }));
 app.use(express.json({ limit: "20kb" }));
 
