@@ -3,45 +3,40 @@ require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const session = require("express-session");
-const MongoStore = require("connect-mongo").default || require("connect-mongo");
+const MongoStore = require("connect-mongo");
 const bcrypt = require("bcryptjs");
 const cors = require("cors");
 
 const app = express();
 const PORT = Number(process.env.PORT) || 5001;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5174";
-const ALLOWED_ORIGINS = new Set([
+const allowedOrigins = new Set([
   CLIENT_URL,
   "https://todo-dmgo.vercel.app",
-  "https://todo-um7e.vercel.app",
+  "http://localhost:5174",
+  "http://127.0.0.1:5174",
 ]);
 
-// Needed when hosted behind a proxy such as Vercel/Render.
-if (process.env.NODE_ENV === "production") {
-  app.set("trust proxy", 1);
-}
+if (process.env.NODE_ENV === "production") app.set("trust proxy", 1);
 
 app.use(cors({
-  origin: "https://todo-dmgo.vercel.app",
-  credentials: true
+  origin(origin, callback) {
+    // Requests without Origin can be health checks or server-to-server calls.
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error("Origin not allowed by CORS"));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
 }));
 app.use(express.json({ limit: "20kb" }));
 
-app.use(session({
-  name: "todo.sid",
-  secret: process.env.SESSION_SECRET || "development-only-change-this-secret",
-  resave: false,
-  saveUninitialized: false,
-  store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
-  cookie: {
-    httpOnly: true,
-    // Frontend and API use different Vercel subdomains, so production
-    // session cookies must support cross-site HTTPS requests.
-    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-    secure: process.env.NODE_ENV === "production",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-  },
-}));
+if (!process.env.MONGO_URI) {
+  throw new Error("Missing MONGO_URI environment variable");
+}
+if (!process.env.SESSION_SECRET) {
+  throw new Error("Missing SESSION_SECRET environment variable");
+}
 
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, maxlength: 80 },
@@ -50,28 +45,57 @@ const userSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const taskSchema = new mongoose.Schema({
-  userId: {
-    type: mongoose.Schema.Types.ObjectId,
-    required: true,
-    ref: "User",
-    index: true,
-  },
+  userId: { type: mongoose.Schema.Types.ObjectId, required: true, ref: "User", index: true },
   title: { type: String, required: true, trim: true, maxlength: 200 },
   completed: { type: Boolean, default: false },
 }, { timestamps: true });
 
-const User = mongoose.model("User", userSchema);
-const Task = mongoose.model("Task", taskSchema);
+const User = mongoose.models.User || mongoose.model("User", userSchema);
+const Task = mongoose.models.Task || mongoose.model("Task", taskSchema);
+
+// Reuse the Mongo connection across serverless invocations.
+let connectionPromise;
+async function ensureDatabase(req, res, next) {
+  try {
+    if (mongoose.connection.readyState !== 1) {
+      if (!connectionPromise) {
+        connectionPromise = mongoose.connect(process.env.MONGO_URI)
+          .catch((err) => {
+            connectionPromise = null;
+            throw err;
+          });
+      }
+      await connectionPromise;
+    }
+    next();
+  } catch (err) {
+    console.error("MongoDB connection failed:", err.message);
+    res.status(503).json({ message: "Database unavailable. Check backend environment variables and MongoDB Atlas access." });
+  }
+}
+app.use(ensureDatabase);
+
+app.use(session({
+  name: "todo.sid",
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  store: MongoStore.create({ mongoUrl: process.env.MONGO_URI, collectionName: "sessions" }),
+  cookie: {
+    httpOnly: true,
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  },
+}));
 
 function auth(req, res, next) {
-  if (!req.session.userId) {
-    return res.status(401).json({ message: "Please log in" });
-  }
+  if (!req.session.userId) return res.status(401).json({ message: "Please log in" });
   next();
 }
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, database: mongoose.connection.readyState === 1 ? "connected" : "connecting" });
+  res.json({ ok: true, database: mongoose.connection.readyState === 1 ? "connected" : "disconnected" });
 });
 
 app.post("/api/register", async (req, res, next) => {
@@ -80,24 +104,17 @@ app.post("/api/register", async (req, res, next) => {
     if (typeof name !== "string" || !name.trim() ||
         typeof email !== "string" || !email.trim() ||
         typeof password !== "string" || password.length < 8) {
-      return res.status(400).json({
-        message: "Enter your name and email, and use a password of at least 8 characters.",
-      });
+      return res.status(400).json({ message: "Enter your name and email, and use a password of at least 8 characters." });
     }
-
     const normalizedEmail = email.trim().toLowerCase();
-    const existing = await User.findOne({ email: normalizedEmail });
-    if (existing) {
+    if (await User.findOne({ email: normalizedEmail })) {
       return res.status(409).json({ message: "Email already registered. Please log in." });
     }
-
     const user = await User.create({
       name: name.trim(),
       email: normalizedEmail,
       password: await bcrypt.hash(password, 12),
     });
-
-    // Regenerate the session after authentication.
     req.session.regenerate((err) => {
       if (err) return next(err);
       req.session.userId = user._id.toString();
@@ -107,25 +124,19 @@ app.post("/api/register", async (req, res, next) => {
       });
     });
   } catch (err) {
-    if (err.code === 11000) {
-      return res.status(409).json({ message: "Email already registered. Please log in." });
-    }
+    if (err.code === 11000) return res.status(409).json({ message: "Email already registered. Please log in." });
     next(err);
   }
 });
 
 app.post("/api/login", async (req, res, next) => {
   try {
-    const email = typeof req.body?.email === "string"
-      ? req.body.email.trim().toLowerCase()
-      : "";
+    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
     const password = typeof req.body?.password === "string" ? req.body.password : "";
     const user = await User.findOne({ email });
-
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ message: "Invalid email or password." });
     }
-
     req.session.regenerate((err) => {
       if (err) return next(err);
       req.session.userId = user._id.toString();
@@ -134,9 +145,7 @@ app.post("/api/login", async (req, res, next) => {
         res.json({ name: user.name, email: user.email });
       });
     });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
 app.get("/api/me", auth, async (req, res, next) => {
@@ -147,9 +156,7 @@ app.get("/api/me", auth, async (req, res, next) => {
       return res.status(401).json({ message: "Please log in" });
     }
     res.json({ name: user.name, email: user.email });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
 app.post("/api/logout", auth, (req, res, next) => {
@@ -166,37 +173,23 @@ app.post("/api/logout", auth, (req, res, next) => {
 
 app.get("/api/tasks", auth, async (req, res, next) => {
   try {
-    const tasks = await Task.find({ userId: req.session.userId }).sort({ createdAt: -1 });
-    res.json(tasks);
-  } catch (err) {
-    next(err);
-  }
+    res.json(await Task.find({ userId: req.session.userId }).sort({ createdAt: -1 }));
+  } catch (err) { next(err); }
 });
 
 app.post("/api/tasks", auth, async (req, res, next) => {
   try {
     const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
-    if (!title || title.length > 200) {
-      return res.status(400).json({ message: "Enter a task between 1 and 200 characters." });
-    }
-    const task = await Task.create({ userId: req.session.userId, title });
-    res.status(201).json(task);
-  } catch (err) {
-    next(err);
-  }
+    if (!title || title.length > 200) return res.status(400).json({ message: "Enter a task between 1 and 200 characters." });
+    res.status(201).json(await Task.create({ userId: req.session.userId, title }));
+  } catch (err) { next(err); }
 });
 
 app.patch("/api/tasks/:id", auth, async (req, res, next) => {
   try {
-    if (typeof req.body?.completed !== "boolean") {
-      return res.status(400).json({ message: "Invalid completion status." });
-    }
-    const task = await Task.findOne({
-      _id: req.params.id,
-      userId: req.session.userId,
-    });
+    if (typeof req.body?.completed !== "boolean") return res.status(400).json({ message: "Invalid completion status." });
+    const task = await Task.findOne({ _id: req.params.id, userId: req.session.userId });
     if (!task) return res.status(404).json({ message: "Task not found." });
-
     task.completed = req.body.completed;
     await task.save();
     res.json(task);
@@ -208,10 +201,7 @@ app.patch("/api/tasks/:id", auth, async (req, res, next) => {
 
 app.delete("/api/tasks/:id", auth, async (req, res, next) => {
   try {
-    const task = await Task.findOneAndDelete({
-      _id: req.params.id,
-      userId: req.session.userId,
-    });
+    const task = await Task.findOneAndDelete({ _id: req.params.id, userId: req.session.userId });
     if (!task) return res.status(404).json({ message: "Task not found." });
     res.json({ message: "Task deleted." });
   } catch (err) {
@@ -223,22 +213,11 @@ app.delete("/api/tasks/:id", auth, async (req, res, next) => {
 app.use((err, req, res, next) => {
   console.error(err);
   if (res.headersSent) return next(err);
-  res.status(500).json({ message: "Server error. Check the backend logs." });
+  res.status(500).json({ message: "Server error. Check backend deployment logs." });
 });
 
-if (!process.env.MONGO_URI) {
-  console.error("Missing MONGO_URI. Add it to server/.env");
-  process.exit(1);
+// Vercel's Express runtime uses the exported app; local development starts a listener.
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`TaskFlow API listening on port ${PORT}`));
 }
-
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`API server running at http://localhost:${PORT}`);
-      console.log(`Allowed frontend: ${CLIENT_URL}`);
-    });
-  })
-  .catch((err) => {
-    console.error("MongoDB connection failed:", err.message);
-    process.exit(1);
-  });
+module.exports = app;
